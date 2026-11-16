@@ -3560,7 +3560,9 @@ When a turn completes with `needs: "nothing"` (and isn't archiving
 itself), the runner checks:
 
 - `unlanded`: commits on the thread's worktree branch that `main` lacks
-  (`git rev-list --count main..<branch>` in the main checkout);
+  (`git rev-list --count main..<branch>` in the main checkout), unless
+  the branch has landed as the cleanup counts it (see Worktrees: squashed
+  or rebased into `main` or `origin/main`);
 - `uncommitted`: files in its worktree, tracked or untracked, that
   `git status --porcelain` lists (ignored ones don't show); and outside
   a worktree of its own (a shared checkout, another repo), the files it
@@ -4939,27 +4941,42 @@ export default {
     check: "./check.sh --quick",    // run by `tb land` before main moves; optional
     teardown: "./scripts/teardown.sh", // run in the worktree's root when the thread is archived
                                     // or deleted, before the cleanup; optional (as setup)
+    folder: "~/Projects/.worktrees", // where the worktrees go: <folder>/<repo>/<id8>; optional
+                                    // (absolute, or starting with ~/)
   },
 }
 ```
 
 The first patch in the thread's own folder chain with a `worktree` wins;
-`~/.threadbear/patches/` and project folders never count. The repo is the
-git toplevel of the folder holding `.threadbear/`, and its main checkout
-is the one with `main` checked out. A malformed `worktree` (not an object,
-or a `setup`, `check` or `teardown` that isn't a command) is the file's `error`.
+project folders never count. The repo is the git toplevel of the folder
+holding `.threadbear/`, and its main checkout is the one with `main`
+checked out. A malformed `worktree` (not an object, a `setup`, `check` or
+`teardown` that isn't a command, a `folder` that's neither absolute nor
+`~/...`) is the file's `error`.
+
+A home patch (`~/.threadbear/patches/`) can have a `worktree` too, with
+only `folder` in it (anything else there is the file's `error`). When no
+patch in the thread's chain has a `worktree`, it gives every thread in a
+git repo a worktree, the repo being the git toplevel of the thread's own
+folder; a folder outside git, or a repo with no checkout on `main`, just
+starts where it is, with no note. Its `folder` is also where a project
+patch's worktrees go when none of the chain's patches with a `worktree`
+gives one (the nearest that does wins). With no `folder` anywhere,
+worktrees go in `<repo>-threads` beside the main checkout. `<repo>` is the
+main checkout's folder name. `tb worktree-folder [DIR]` prints the folder
+a repo's worktrees go in.
 
 A new thread in such a repo (from `threads.create`, `create_thread` or a
 schedule, unless `worktree: false`) gets, before its first turn starts:
-`git worktree add -b thread/<id8> <parent>/<repo>-threads/<id8> main` from
+`git worktree add -b thread/<id8> <folder>/<repo>/<id8> main` from
 the main checkout (`<id8>` is the thread id's first 8 characters), a `cwd`
 in the same subfolder of it, `setup` run in its root (an `action.run` with
 `trigger: "worktree.setup"`, under the first turn; a failure is shown and
 the turn goes on), and a few lines in the agent's appended system prompt
 saying where it is and that `tb land` puts it on main. If the worktree
 can't be made (a leftover folder or branch of that name, no checkout on
-`main`), a `system.note` says why and the thread starts in the folder
-asked for. The summary carries `worktree` from then on.
+`main` for a project patch's), a `system.note` says why and the thread
+starts in the folder asked for. The summary carries `worktree` from then on.
 
 `tb land` rebases first (refusing straight away on a conflict), then takes
 an OS lock at `threadbear-land.lock` in the repo's common git directory,
@@ -4999,8 +5016,13 @@ which it's ended (SIGKILL if SIGTERM doesn't do it), and a failure is
 shown but doesn't stop the cleanup. It runs once per archive, and only
 while the folder is still the thread's own worktree on its branch, not a
 link to somewhere else. Then a
-worktree whose branch is on main
-(or has nothing of its own) is removed with its branch; otherwise both stay,
+worktree whose branch has landed is removed with its branch: it's an
+ancestor of `main`, or merging it into `main` changes nothing (`git
+merge-tree --write-tree` gives main's tree: a squashed or rebased PR,
+cherry-picks), asked of local `main` and then of `origin/main` after a
+`git fetch origin main` (at most once a minute per repo; a failure leaves
+local `main`'s answer). The loose ends' `unlanded` line goes by the same
+test. Otherwise both stay,
 with a `system.note` saying how to land or drop them. A thread whose
 worktree was removed carries on in the main checkout, with a note. One whose
 worktree stayed carries on in it, and its next turn says (to Mike and the

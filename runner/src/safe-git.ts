@@ -71,7 +71,8 @@ export function untrustedGitSync(dir: string, args: readonly string[]): string {
 //   runs commands a repo's config names (`lfs.extension.*`, custom
 //   transfers). Files go across as the disk has them.
 // - diff drivers' programs blank, for the same reason, though none of a
-//   move's commands diff.
+//   move's commands diff. Merge drivers' are `false`, so a merge-tree's
+//   file that would need one is a conflict.
 // - no commit signing (gpg.program is the repo's to name), no submodule
 //   recursion (a submodule's own config isn't read here), no auto gc.
 // - with `network`, for a fetch or a clone: only https, ssh and file, and
@@ -146,6 +147,12 @@ export function repoProofConfig(entries: readonly ConfigEntry[], network?: 'bund
     if (f) drivers.add(`filter.${f[1]}`);
     const d = /^diff\.(.+)\.(command|textconv)$/.exec(e.key);
     if (d) out.push('-c', `${settable(`diff.${d[1]}.${d[2]}`)}=`);
+    // A merge driver's program (for a merge-tree's file the attributes give
+    // one) is `false`, so that file is a conflict: the repo's own driver
+    // could keep one side's file and drop the other's change, and the branch
+    // would read as already merged (worktrees.ts landedOnMain).
+    const m = /^merge\.(.+)\.driver$/.exec(e.key);
+    if (m) out.push('-c', `${settable(e.key)}=false`);
   }
   for (const d of drivers) out.push('-c', `${settable(`${d}.clean`)}=`, '-c', `${d}.smudge=`, '-c', `${d}.process=`, '-c', `${d}.required=false`);
   if (network === 'remote') {
@@ -188,8 +195,8 @@ export async function untrustedGit(dir: string, args: readonly string[], opts: U
   const timeout = opts.timeoutMs ?? (opts.network === 'remote' ? 30 * 60_000 : 5 * 60_000);
   const [sub, ...rest] = args;
   // Only what the runner's callers run (move-git.ts, runner/moves.ts,
-  // loose-ends.ts), each looked at for what a repo's config could make it
-  // run: a new one is added here once it has been (Muse's review, 11 Nov
+  // loose-ends.ts, worktrees.ts landedOnMain), each looked at for what a
+  // repo's config could make it run: a new one is added here once it has been (Muse's review, 11 Nov
   // 2026: log, show, merge, stash and the like reach submodules or diff
   // programs these settings don't cover).
   if (!sub || !SUBCOMMANDS.has(sub) || (sub === 'worktree' && rest[0] !== 'list')) return { ok: false, code: 1, stdout: '', stderr: `untrustedGit doesn't run git ${[sub, sub === 'worktree' ? rest[0] : undefined].filter(Boolean).join(' ')}: nobody has looked at what a repo's config could make it run.` };
@@ -211,7 +218,7 @@ export async function untrustedGit(dir: string, args: readonly string[], opts: U
 
 // What untrustedGit runs. `git submodule` isn't one: it runs git in each
 // submodule with that submodule's own config.
-const SUBCOMMANDS = new Set(['add', 'branch', 'bundle', 'cat-file', 'clone', 'commit-tree', 'diff', 'diff-files', 'diff-index', 'fetch', 'for-each-ref', 'ls-files', 'ls-remote', 'merge-base', 'read-tree', 'remote', 'reset', 'rev-list', 'rev-parse', 'status', 'symbolic-ref', 'update-ref', 'worktree', 'write-tree']);
+const SUBCOMMANDS = new Set(['add', 'branch', 'bundle', 'cat-file', 'clone', 'commit-tree', 'diff', 'diff-files', 'diff-index', 'fetch', 'for-each-ref', 'ls-files', 'ls-remote', 'merge-base', 'merge-tree', 'read-tree', 'remote', 'reset', 'rev-list', 'rev-parse', 'status', 'symbolic-ref', 'update-ref', 'worktree', 'write-tree']);
 
 // A submodule is a repo of its own, with its own config (.git/modules/<name>/
 // config, or a .git inside it), and the settings above only switch off what

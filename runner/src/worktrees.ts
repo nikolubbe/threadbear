@@ -12,7 +12,7 @@ import path from 'node:path';
 import type { WorktreePatch } from './patches.ts';
 import { inBackground } from './background.ts';
 import { mainCheckoutOf as linkedMainCheckout } from './patch-trust.ts';
-import { untrustedGitArgs } from './safe-git.ts';
+import { untrustedGit, untrustedGitArgs } from './safe-git.ts';
 import { LAND_TIMES_FILE, joinQueue, leaveQueue, queueDir, readEntry, setRunning, waiting, waitingLine, writeEntry, type QueueEntry } from './land-queue.ts';
 
 // What a thread's record keeps about its worktree.
@@ -34,8 +34,8 @@ export type WorktreeRecord = {
   // it's another thread's now, or will be.
   spare?: boolean;
   // The patch that asked for the worktree, relative to `path`: its copy
-  // there is where the teardown is read from. Absent in records from before
-  // 9 Nov, which look for it from the thread's folder.
+  // there is where the teardown is read from. Absent for one a home patch
+  // asked for, which has nothing to run there.
   patchFile?: string;
   // When the patch's teardown last ran (it runs as the cleanup starts). Each
   // archive clears it, so it runs once per archive: a delete or the next
@@ -168,19 +168,33 @@ export function sameSubfolder(cwd: string, from: string, to: string): string {
 
 // --------------------------------------------------------------- making
 
-// `patchFile`: the worktree's own copy of the patch that asked for it.
-export type MadeWorktree = { ok: true; worktree: WorktreeRecord; cwd: string; patchFile: string } | { ok: false; reason: string };
+// `patchFile`: the worktree's own copy of the patch that asked for it (none
+// for a home patch's). `quiet`: a home patch's worktree that can't be, as
+// the folder isn't in a git repo or none of its checkouts is on main. Home's
+// patch asks for every thread, so that's no news worth a note.
+export type MadeWorktree = { ok: true; worktree: WorktreeRecord; cwd: string; patchFile?: string } | { ok: false; reason: string; quiet?: true };
+
+// The folder a repo's worktrees go in: `<folder>/<repo>` when a patch says
+// where (worktree.folder), else `<repo>-threads` beside the main checkout.
+// `<repo>` is the main checkout's folder name. `tb worktree-folder` prints
+// it, for borrow-worktree.sh.
+export function threadsFolder(mainCheckout: string, folder?: string): string {
+  const repo = path.basename(mainCheckout);
+  return folder ? path.join(folder, repo) : path.join(path.dirname(mainCheckout), `${repo}-threads`);
+}
 
 // Makes the thread's worktree from main in the main checkout. A leftover
-// branch of the thread's name is a reason, never overwritten.
+// branch of the thread's name is a reason, never overwritten. The repo is
+// the one the project patch is in, or for a home patch the one the thread's
+// folder is in.
 //
 // Without the patch's `keep`: `git worktree add -b thread/<id8>
-// <parent>/<repo>-threads/<id8> main`, and a leftover folder of that name
-// is a reason too.
+// <threads folder>/<id8> main`, and a leftover folder of that name is a
+// reason too.
 //
 // With `keep`: a spare, if there is one (see "spares" below), switched to
 // the new branch with its kept folders left as they were; otherwise a new
-// `<repo>-threads/slot-<n>`. The folder isn't named after the thread, as
+// `<threads folder>/slot-<n>`. The folder isn't named after the thread, as
 // it outlives it.
 export function makeWorktree(opts: { cwd: string; threadId: string; patch: WorktreePatch }): Promise<MadeWorktree> {
   // One at a time, so two new threads never take the same spare or slot.
@@ -195,12 +209,13 @@ export function makeWorktree(opts: { cwd: string; threadId: string; patch: Workt
 let making: Promise<void> = Promise.resolve();
 
 async function makeWorktreeNow(opts: { cwd: string; threadId: string; patch: WorktreePatch }): Promise<MadeWorktree> {
-  const top = await gitOut(opts.patch.folder, ['rev-parse', '--show-toplevel']);
-  if (!top) return { ok: false, reason: `the ${opts.patch.patch} patch asks for one, but ${opts.patch.folder} isn't in a git repo` };
+  const quiet = opts.patch.home ? { quiet: true as const } : {};
+  const top = await gitOut(opts.patch.repoFrom, ['rev-parse', '--show-toplevel']);
+  if (!top) return { ok: false, reason: `the ${opts.patch.patch} patch asks for one, but ${opts.patch.repoFrom} isn't in a git repo`, ...quiet };
   const mainCheckout = await mainCheckoutOf(top);
-  if (!mainCheckout) return { ok: false, reason: `no checkout of ${path.basename(top)} has ${MAIN} checked out` };
+  if (!mainCheckout) return { ok: false, reason: `no checkout of ${path.basename(top)} has ${MAIN} checked out`, ...quiet };
   const repo = path.basename(mainCheckout);
-  const threads = path.join(path.dirname(mainCheckout), `${repo}-threads`);
+  const threads = threadsFolder(mainCheckout, opts.patch.folder);
   const id8 = opts.threadId.slice(0, 8);
   const branch = threadBranch(opts.threadId);
   const keep = opts.patch.keep;
@@ -210,12 +225,12 @@ async function makeWorktreeNow(opts: { cwd: string; threadId: string; patch: Wor
   }
   const base = await gitOut(mainCheckout, ['rev-parse', MAIN]);
   if (!base) return { ok: false, reason: `couldn't read ${MAIN} in ${mainCheckout}` };
-  const patchFile = path.relative(top, realpath(opts.patch.file));
+  const patchFile = opts.patch.home ? undefined : path.relative(top, realpath(opts.patch.file));
   const done = (where: string): MadeWorktree => ({
     ok: true,
-    worktree: { repo, mainCheckout, path: where, branch, base, ...(keep ? { keep } : {}), patchFile },
+    worktree: { repo, mainCheckout, path: where, branch, base, ...(keep ? { keep } : {}), ...(patchFile ? { patchFile } : {}) },
     cwd: sameSubfolder(opts.cwd, top, where),
-    patchFile: path.join(where, patchFile),
+    ...(patchFile ? { patchFile: path.join(where, patchFile) } : {}),
   });
 
   if (keep) {
@@ -257,7 +272,7 @@ const SPARE = 'threadbear spare';
 // removed as before.
 export const MAX_SPARES = 6;
 
-// The repo's spares, in `threads` (its <repo>-threads folder).
+// The repo's spares, in `threads` (its threads folder, threadsFolder).
 async function spares(mainCheckout: string, threads: string): Promise<string[]> {
   const dir = realpath(threads);
   return ((await listCheckouts(mainCheckout)) ?? [])
@@ -1475,6 +1490,55 @@ export async function landTargetFromGit(cwd: string, threadId?: string): Promise
 
 // ------------------------------------------------------------- cleaning up
 
+// Whether everything on `branch` (a ref in the main checkout's repo) is on
+// main: it's an ancestor of main, or merging it into main changes nothing
+// (`git merge-tree` gives main's own tree). Niko, 16 Nov 2026: his repos land
+// through squashed GitHub PRs, which git never counts as merged, so their
+// worktrees were never cleaned up. A squash, a rebase merge or cherry-picks
+// all leave main with the branch's changes and nothing to merge. Asked of
+// local main first, then of origin's, after a fetch of it (PRs merge on
+// GitHub): a fetch that fails, or no origin, leaves just local main. Any git
+// that fails or times out counts as not landed, the safe answer: the cleanup
+// then keeps the branch and the loose ends list it.
+//
+// Through safe-git: the loose ends check asks this by itself as a turn ends,
+// in any repo a thread has a worktree of, and a merge could run a merge
+// driver the repo's config names (safe-git.ts turns those off).
+export async function landedOnMain(mainCheckout: string, branch: string, timeoutMs = gitLimits.timeoutMs): Promise<boolean> {
+  const run = (args: string[]) => untrustedGit(mainCheckout, args, { timeoutMs });
+  const onto = async (target: string): Promise<boolean> => {
+    if ((await run(['merge-base', '--is-ancestor', branch, target])).ok) return true;
+    // Exit 1 is a conflict: the branch has something main doesn't.
+    const merged = await run(['merge-tree', '--write-tree', target, branch]);
+    if (!merged.ok) return false;
+    const tree = await run(['rev-parse', '--verify', '--quiet', `${target}^{tree}`]);
+    return tree.ok && tree.stdout.trim() !== '' && merged.stdout.split('\n')[0]?.trim() === tree.stdout.trim();
+  };
+  if (await onto(`refs/heads/${MAIN}`)) return true;
+  await fetchOriginMain(mainCheckout, timeoutMs);
+  const remote = `refs/remotes/origin/${MAIN}`;
+  if (!(await run(['rev-parse', '--verify', '--quiet', remote])).ok) return false;
+  return onto(remote);
+}
+
+// How often landedOnMain fetches a repo's origin main, at most, and how long
+// one fetch may take. The loose ends check asks each time a thread is
+// opened; once a minute is enough to see a PR merged meanwhile.
+export const fetchLimits = { everyMs: 60_000, timeoutMs: 30_000 };
+const fetched = new Map<string, { at: number; done: Promise<void> }>();
+
+function fetchOriginMain(mainCheckout: string, timeoutMs: number): Promise<void> {
+  const key = realpath(mainCheckout);
+  const hit = fetched.get(key);
+  if (hit && Date.now() - hit.at < fetchLimits.everyMs) return hit.done;
+  const done = untrustedGit(mainCheckout, ['fetch', '--quiet', '--no-tags', '--no-write-fetch-head', 'origin', `+refs/heads/${MAIN}:refs/remotes/origin/${MAIN}`], {
+    network: 'remote',
+    timeoutMs: Math.min(timeoutMs, fetchLimits.timeoutMs),
+  }).then(() => undefined);
+  fetched.set(key, { at: Date.now(), done });
+  return done;
+}
+
 // `taken`: the folder is another checkout's now (another thread's worktree,
 // a spare or a borrowed one), so it was left alone; only this thread's
 // landed branch, if it was still there, went.
@@ -1564,7 +1628,8 @@ export async function stillCheckedOut(w: WorktreeRecord): Promise<boolean> {
 }
 
 // When its thread is archived or deleted: a worktree whose branch is all
-// on main is removed with its branch (`--force` only for untracked
+// on main (landedOnMain: merged, squashed or rebased, here or on origin) is
+// removed with its branch (`--force` only for untracked
 // files), or, with `keep` and room for another spare, set aside as one;
 // otherwise both stay, and the reason says why.
 export async function cleanUpWorktree(w: WorktreeRecord, stillOurs: () => boolean = () => true): Promise<Cleanup> {
@@ -1578,9 +1643,8 @@ export async function cleanUpWorktree(w: WorktreeRecord, stillOurs: () => boolea
   const ref = await git(w.mainCheckout, ['rev-parse', '--verify', '--quiet', `refs/heads/${w.branch}`]);
   if (!ref.ok && ref.code !== 1) return { removed: false, reason: `git couldn't tell whether ${w.branch} is still there` };
   let branchThere = ref.ok;
-  if (branchThere) {
-    const merged = await git(w.mainCheckout, ['merge-base', '--is-ancestor', w.branch, MAIN]);
-    if (!merged.ok) return { removed: false, reason: `${w.branch} has commits that aren't on ${MAIN}` };
+  if (branchThere && !(await landedOnMain(w.mainCheckout, `refs/heads/${w.branch}`))) {
+    return { removed: false, reason: `${w.branch} has commits that aren't on ${MAIN}` };
   }
   // A record can outlive its worktree without hearing (THREADBEAR-16: a
   // handover saved it while the cleanup ran), and slot folders are reused.
@@ -1646,13 +1710,14 @@ export async function cleanUpWorktree(w: WorktreeRecord, stillOurs: () => boolea
     if (!stillOurs()) return LET_GO;
     await git(w.mainCheckout, ['worktree', 'prune']);
   }
-  // Checked above that it's all on main, so -D loses nothing.
+  // Checked above that it's all on main (landedOnMain), so -D loses nothing.
   if (branchThere) {
     if (!stillOurs()) return LET_GO;
     const del = await git(w.mainCheckout, ['branch', '-D', w.branch]);
     if (!del.ok) return { removed: true, branchLeft: `deleting ${w.branch} failed: ${firstLine(del.stderr)}` };
   }
-  // The <repo>-threads folder, once it's empty.
+  // The repo's threads folder, once it's empty (never the folder holding
+  // it: `<folder>` of `<folder>/<repo>`, or the main checkout's parent).
   try {
     fs.rmdirSync(path.dirname(w.path));
   } catch {

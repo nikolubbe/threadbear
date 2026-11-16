@@ -9,7 +9,8 @@ when its checks pass.
 
 ## Opting in
 
-Only repos that ask. A patch (docs/protocol.md, "Patches") can say:
+A repo asks with a patch of its own, or the home patch asks for every repo
+(below). A repo's patch (docs/protocol.md, "Patches") can say:
 
 ```ts
 export default {
@@ -23,15 +24,51 @@ export default {
     // Run in the worktree's root when the thread is archived or deleted,
     // before the cleanup. Optional. Held to the same trust rules as setup.
     teardown: "./scripts/teardown.sh",
+    // Where the worktrees go: <folder>/<repo>/<id8>. Optional; absolute,
+    // or starting with ~/.
+    folder: "~/Projects/.worktrees",
   },
   // actions, panels, hooks as before
 };
 ```
 
-The first patch in the thread's folder chain with a `worktree` wins (home's
-`~/.threadbear/patches/` never counts: worktrees are a repo's choice). The
+The first patch in the thread's folder chain with a `worktree` wins. The
 repo is the git toplevel of the folder the patch is in, and its main
 checkout is the one with `main` checked out.
+
+Niko, 16 Nov 2026: he wanted every repo of his to get a worktree per
+thread, all in one place (`~/Projects/.worktrees/<repo>/<worktree>`), and
+cleaned up when the thread is archived, without a patch in each repo. So
+a home patch (`~/.threadbear/patches/*.ts`) can have a `worktree` too:
+
+```ts
+export default {
+  worktree: { folder: "~/Projects/.worktrees" },
+};
+```
+
+It takes only `folder`: a `setup`, `check`, `teardown` or `keep` there is
+the patch's load error, saying so, as what runs in a repo is that repo's
+to say. It does two things:
+
+- When no patch in the thread's folder chain has a `worktree`, every new
+  thread whose folder is in a git repo gets one. The repo is the git
+  toplevel of the thread's own folder. A folder outside git, or a repo
+  with no checkout on `main` (one whose branch is `master`, say), just
+  starts where it is, with no note: the home patch asks for every thread,
+  so that's no news. A repo's own patch still says why when it can't have
+  one.
+- Its `folder` is where a repo's patch's worktrees go when that patch
+  gives no folder of its own. The nearest patch with a `worktree` that
+  gives a `folder` wins: the thread's folder chain first, nearest first,
+  then home's.
+
+A home patch's worktree has no setup, check or teardown, and nothing of it
+is read from the worktree (there's no copy of it there). With no `folder`
+anywhere, worktrees go in `<repo>-threads` beside the main checkout, as
+before. `<repo>` is always the main checkout's folder name, so two repos
+with the same name share `<folder>/<repo>`; their worktrees are told apart
+by git's own list.
 
 `setup`, `check` and turn hooks run below normal priority, as do the
 runner's own update builds, so a land's test suite doesn't take the Mac
@@ -45,11 +82,13 @@ runs at background priority. Action buttons you press run as normal.
 `threads.create` (and `create_thread`, and schedules that start a thread)
 for a folder inside an opted-in repo:
 
-1. Makes `git worktree add -b thread/<id8> <parent>/<repo>-threads/<id8>
-   main` from the main checkout, where `<id8>` is the first 8 characters of
-   the thread id. A leftover folder or branch of that name is an error
-   shown in the thread, and the thread starts in the main checkout as
-   before.
+1. Makes `git worktree add -b thread/<id8> <threads>/<id8> main` from the
+   main checkout, where `<id8>` is the first 8 characters of the thread id
+   and `<threads>` is `<folder>/<repo>` (the `folder` above) or
+   `<parent>/<repo>-threads`. A leftover folder or branch of that name is
+   an error shown in the thread, and the thread starts in the main
+   checkout as before. `tb worktree-folder [DIR]` prints `<threads>` for
+   the repo DIR is in.
 2. The thread's `cwd` is the same subfolder of the worktree as the folder
    asked for (asking for `~/dev/me/threadbear/runner` gives
    `.../threadbear-threads/<id8>/runner`).
@@ -60,8 +99,10 @@ for a folder inside an opted-in repo:
    that copy (with the scripts it names, as they are in the worktree) is
    trusted; otherwise a note says the setup was skipped (docs/protocol.md,
    "Trusting a folder's patches").
-4. The record keeps `worktree: { repo, mainCheckout, path, branch, base }`
-   (`base` is main's commit when it was made); the summary carries
+4. The record keeps `worktree: { repo, mainCheckout, path, branch, base,
+   patchFile }` (`base` is main's commit when it was made, `patchFile`
+   the patch that asked, relative to `path`, absent for the home patch's);
+   the summary carries
    `worktree?: { branch, mainCheckout }` so the app can show it.
 5. `threads.create` takes `worktree: false` to start in the folder as
    before.
@@ -327,12 +368,30 @@ ran, so whatever setup made may be gone and setup may need running again
 Archived again, it tears down again. Since a runner stopping partway runs
 it again next time, a teardown should be safe to run twice.
 
-When a thread with a worktree is archived or deleted: if its branch is
-merged into main (or has no commits of its own), the worktree is removed
-(`git worktree remove`, `--force` only for untracked files) and the branch
-deleted. Otherwise both stay, with a `system.note` saying so and how to
-land or drop them. Unarchiving a thread whose worktree was removed starts
-its next turn in the main checkout, with a note.
+When a thread with a worktree is archived or deleted: if its branch has
+landed, the worktree is removed (`git worktree remove`, `--force` only for
+untracked files) and the branch deleted. Otherwise both stay, with a
+`system.note` saying so and how to land or drop them. Unarchiving a thread
+whose worktree was removed starts its next turn in the main checkout, with
+a note. The folder holding it (`<folder>/<repo>` or `<repo>-threads`) goes
+too once it's empty; `<folder>` itself never does.
+
+Niko, 16 Nov 2026: his repos land through squashed GitHub PRs as well, so
+"landed" isn't just "merged" (`landedOnMain` in `runner/src/worktrees.ts`).
+The branch has landed when it's an ancestor of main (it has nothing of its
+own, or `tb land` put it there), or when merging it into main changes
+nothing: `git merge-tree --write-tree main <branch>` gives main's own
+tree. That covers a squash, a rebase merge and cherry-picks. It's asked of
+local `main` first, then of `origin/main` after a `git fetch origin main`
+(PRs merge on GitHub, and this Mac's main may not have it yet), at most
+once a minute per repo, killed after 30 seconds; a fetch that fails, or a
+repo with no `origin`, leaves local main's answer. Any git that fails or
+times out counts as not landed, so the branch stays, and the branch is
+only deleted (`-D`) once it's known to have landed. A merge driver the
+repo's config names is never run for it (`runner/src/safe-git.ts`): a file
+that would need one counts as a conflict. The done card's loose ends
+(`unlanded`) go by the same test, so a squash-merged thread isn't listed as
+having work off main. `tb land` keeps its own ancestry rules.
 
 An archive's cleanup waits for the thread's turn-end hooks, which run in that
 folder: on 7 Nov a typecheck lost its files partway through, "failed", and
@@ -380,8 +439,11 @@ worktree: { setup: "...", check: "...", keep: ["app/.build", "dock/.build"] },
 
 With `keep`:
 
-- New worktrees are `<repo>-threads/slot-<n>`, not `<id8>`, as the folder
-  outlives the thread.
+- New worktrees are `<threads>/slot-<n>` (`<folder>/<repo>` or
+  `<repo>-threads`, above), not `<id8>`, as the folder outlives the thread.
+  A spare is only taken from that folder, so worktrees made before a
+  `folder` was set stay where they are and are cleaned up there, but
+  aren't handed out again.
 - Cleaning up a landed one detaches it, deletes its branch and locks it
   (`git worktree lock --reason "threadbear spare"`): a spare. Past six
   spares (`MAX_SPARES`), it's removed as before.
@@ -409,7 +471,10 @@ With `keep`:
   brought back carried on in it beside the borrower's work.
 
 A thread started outside the repo borrows one by hand with
-`./borrow-worktree.sh` and gives it back with `--give-back <dir>`. The
+`./borrow-worktree.sh` and gives it back with `--give-back <dir>`. It asks
+`tb worktree-folder` where the slots are (the runner's own `tb`, on PATH in
+a thread, else the checkout's `runner/bin/tb`), so it finds and makes them
+where the runner does. The
 borrowed one is on a branch of its own, `thread/borrow-<slot>-<time>`,
 so `tb land` in it lands it like any thread's (it only lands a `thread/`
 branch); giving it back deletes that branch. Run in a thread, `tb land`
@@ -478,4 +543,5 @@ the fetch: everything has to be inside the one locked command.
   just stays where it is until the thread is archived).
 - Showing the branch in the app beyond the summary field.
 - Projects (docs/projects-design.md): when patches load from project
-  folders, `worktree` still only counts from the thread's own folder chain.
+  folders, `worktree` still only counts from the thread's own folder chain
+  and home's.

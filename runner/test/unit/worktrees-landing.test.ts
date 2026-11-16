@@ -365,6 +365,26 @@ test('borrow-worktree.sh hands out a thread/ branch tb land takes, and --give-ba
   assert.match((await landTargetFromGit(wt)).reason ?? '', /is detached.*git checkout -b thread\/<name>/);
 });
 
+test("tb worktree-folder says where the runner puts a repo's worktrees, and borrow-worktree.sh makes and finds its slots there", async () => {
+  const { root, main } = makeRepo(PATCH(`{ setup: "touch .setup-ran", keep: ["app/.build"] }`));
+  addBorrowScript(main);
+  assert.equal(sh(path.join(main, 'runner'), 'tb worktree-folder'), path.join(root, 'proj-threads'), 'no folder anywhere: beside the main checkout');
+  // A home patch's folder, for a repo whose own patch gives none.
+  const home = fs.realpathSync(tmpDir('tb-home-'));
+  const folder = path.join(root, 'worktrees');
+  write(home, { '.threadbear/patches/worktrees.ts': PATCH(`{ folder: ${JSON.stringify(folder)} }`) });
+  const withHome = (cmd: string) => sh(main, `HOME='${home}' ${cmd}`);
+  assert.equal(withHome(`tb worktree-folder ${main}`), path.join(folder, 'proj'));
+  const wt = withHome('./borrow-worktree.sh 2>/dev/null');
+  assert.equal(wt, path.join(folder, 'proj', 'slot-1'));
+  assert.match(withHome(`./borrow-worktree.sh --give-back ${wt}`), /is a spare again/);
+  // The runner, reading the same patches, takes that spare.
+  const made = await makeWorktree({ cwd: main, threadId: 'aaaaaaaa-1', patch: (await findWorktreePatch(main, home))! });
+  assert.ok(made.ok);
+  assert.equal(made.worktree.path, wt);
+  assert.throws(() => sh(root, 'tb worktree-folder'), /isn't in a git checkout/);
+});
+
 test('a borrowed spare is never given to a new thread until it is given back', async () => {
   const { root, main } = makeRepo(PATCH(`{ setup: "touch .setup-ran", keep: ["app/.build"] }`));
   addBorrowScript(main);

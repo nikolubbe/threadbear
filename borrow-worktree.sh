@@ -27,7 +27,6 @@ MAIN="$(git -C "$ROOT" worktree list --porcelain | awk '
   /^branch refs\/heads\/main$/ && !found { print path; found = 1 }
 ')"
 [ -n "$MAIN" ] || { echo "No checkout of this repo has main checked out." >&2; exit 1; }
-THREADS="$(dirname "$MAIN")/$(basename "$MAIN")-threads"
 SPARE="threadbear spare"
 # The patch's worktree.keep (.threadbear/patches/checks.ts).
 KEEP=(-e /app/.build -e /dock/.build)
@@ -63,6 +62,13 @@ if [ "${1:-}" = "--give-back" ]; then
   echo "$dir is a spare again."
   exit 0
 fi
+
+# Where the runner keeps this repo's thread worktrees, as it works it out
+# (tb worktree-folder: <worktree.folder>/<repo> when a patch, the repo's or
+# home's, says where, else <repo>-threads beside the main checkout). The
+# runner's own tb, on PATH in a thread, else this checkout's.
+TB="$(command -v tb || echo "$ROOT/runner/bin/tb")"
+THREADS="$("$TB" worktree-folder "$MAIN")"
 
 # A thread/ branch of its own, as a runner-made worktree has, so `tb land`
 # takes it (landTargetFromGit in runner/src/worktrees.ts). The time keeps

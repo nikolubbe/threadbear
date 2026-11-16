@@ -11,7 +11,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { BackgroundTask, LooseEnd, Schedule } from './protocol.ts';
-import { MAIN, type WorktreeRecord } from './worktrees.ts';
+import { landedOnMain, MAIN, type WorktreeRecord } from './worktrees.ts';
 import { untrustedGit } from './safe-git.ts';
 import { cutSafely } from './safe-cut.ts';
 
@@ -23,6 +23,8 @@ import { cutSafely } from './safe-cut.ts';
 const readGit = (dir: string, args: string[]) => untrustedGit(dir, args, { timeoutMs: 30_000 });
 
 // The thread's own worktree: commits on its branch that main doesn't have,
+// unless the branch has landed some other way (landedOnMain: squashed or
+// rebased into main, here or on origin, as the archive's cleanup counts it),
 // and files in it that aren't committed. Untracked ones count, as a new
 // file the agent wrote and never committed is lost when the worktree goes;
 // ignored ones (build output, the linked node_modules) don't show at all.
@@ -35,7 +37,7 @@ export async function worktreeLooseEnds(w: WorktreeRecord): Promise<LooseEnd[]> 
   const out: LooseEnd[] = [];
   const ahead = await readGit(w.mainCheckout, ['rev-list', '--count', `${MAIN}..refs/heads/${w.branch}`]);
   const commits = ahead.ok ? Number.parseInt(ahead.stdout.trim(), 10) : 0;
-  if (commits > 0) out.push({ kind: 'unlanded', text: `${commits === 1 ? '1 commit' : `${commits} commits`} on ${w.branch} ${commits === 1 ? "isn't" : "aren't"} on ${MAIN}` });
+  if (commits > 0 && !(await landedOnMain(w.mainCheckout, `refs/heads/${w.branch}`, 30_000))) out.push({ kind: 'unlanded', text: `${commits === 1 ? '1 commit' : `${commits} commits`} on ${w.branch} ${commits === 1 ? "isn't" : "aren't"} on ${MAIN}` });
   const status = await readGit(w.path, ['status', '--porcelain', '--untracked-files=all']);
   const files = status.ok ? status.stdout.split('\n').filter((l) => l.trim()).length : 0;
   if (files > 0) out.push({ kind: 'uncommitted', text: `${files === 1 ? '1 file' : `${files} files`} in its worktree ${files === 1 ? "isn't" : "aren't"} committed` });

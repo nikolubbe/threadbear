@@ -255,6 +255,14 @@ File references are where to look.
   status checks whether that process is still alive.
   `threadbear-land-done/` there keeps, for a week, what
   landed for a landing whose `tb` was stopped before it heard.
+- **Thread worktrees** (`runner/src/worktrees.ts`): a repo whose patch
+  asks, or every repo when a home patch has a `worktree`, gets a git
+  worktree per new thread, in `<repo>-threads` beside the repo or the
+  patch's `folder` (docs/thread-worktrees.md). When a thread is archived or
+  deleted, or its done card checks for loose ends, and its branch isn't on
+  your local `main`, the runner runs `git fetch origin main` in that repo
+  (at most once a minute per repo, 30 seconds at most) to see whether it
+  was merged there, a squashed PR say.
 - **The runner** listens on `127.0.0.1:8797` only, and needs a token
   (`runner/src/config.ts`). It starts the official `claude` and `codex`
   CLIs for your threads. Each thread's CLI gets a key of its own in its
@@ -593,6 +601,7 @@ File references are where to look.
 | Convex (the Convex panel) | yours | Only for a thread in a Convex project, when its Convex panel opens: the runner's Convex CLI asks api.convex.dev for the project's deployments and a deploy key, the runner asks the deployment whether a kept key still works (`/api/check_admin_key`), and the panel loads Convex's embedded dashboard (dashboard-embedded.convex.dev) with that key. Sign in to Convex goes to auth.convex.dev. (`runner/src/convex-keys.ts`) |
 | Your other Macs, over ssh | yours | Only when you run `tb runner add <name> --ssh <host>` or `tb runner check --ssh <host>` on your first Mac: it reads that Mac's Threadbear `runner.json`, writes its id and the deployment's address there if it hasn't them, writes its new key into that Mac's `secrets/convex-key`, and looks whether that Mac has a deploy key, Convex panel keys or a Convex login (names only, never a key), through your own ssh setup with agent and port forwarding off (`runner/src/runner-keys.ts`). `tb runner audit` asks this Mac's runner for its threads' last seqs and your deployment for what the main key made. `tb runner rotate-owner` sets env vars on your deployment with your deploy key, and, if you give it a Convex team access token for that run (`CONVEX_TEAM_TOKEN`, never kept), asks api.convex.dev for the deployment's deploy keys (their names and dates) before it rotates. |
 | Your update build hosts, over ssh | yours | Only from the installed GPUI app, when `runner.json` has `updateBuildHosts` and main's `desktop/` has changed: a copy of your main's files to build it from, rsynced to `~/.cache/threadbear-check/gpui` on the first one that's a Mac and answers, and the two built binaries copied back (`desktop/scripts/stage-update.sh`) |
+| Your repos' `origin` | yours | `git fetch origin main`, through your own git and its credentials, in a repo with a thread worktree whose branch isn't on your local `main`, when the thread is archived or deleted or its done card checks for loose ends, at most once a minute per repo. Nothing is sent |
 | GitHub | Mike's repo | Release tags fetched every 6 hours; the fork at setup; from `tb land`, through your `gh`, a marked workflow's recent runs on main |
 | cef-builds.spotifycdn.com | Spotify (CEF's official builds) | The installed Mac runner, only while a web runtime is installed, reads `/index.json` once a day, a minute after starting if due, to warn when this release's CEF pin is over 14 days behind stable (or checks fail for 3 days). Dev runners/tests do not poll; `THREADBEAR_CLI_UPDATES=off` disables it too. It sends no user content and stores the check in `<home>/runner/web-runtime-check.json`. From the GPUI app, only when you press Install web runtime: one download of the pinned build (135 MB), which nothing is sent with. Threadbear will publish its own signed copy later. Chromium itself then goes online only for the pages the GPUI app's web panels show; its own background requests are off (`--disable-background-networking`), and an agent's html and diagrams reach nothing (`desktop/web/src/mac/sealed.rs`). |
 | downloads.claude.ai, registry.npmjs.org | Anthropic, npm | CLI version checks and installs; `npm ci` |

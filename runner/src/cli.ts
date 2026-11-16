@@ -15,7 +15,7 @@ import { parseWhen as parseLater, relativeFuture } from './when.ts';
 import { DEV_HELP, formatModels, logsCommand, runDev } from './tb-dev.ts';
 import { findWorktreePatch, isInside } from './patches.ts';
 import { TRUST_ALL } from './patch-trust.ts';
-import { checkoutTop, land, landTargetFromGit, realpath, type LandTarget } from './worktrees.ts';
+import { checkoutTop, land, landTargetFromGit, mainCheckoutOf, MAIN, realpath, threadsFolder, type LandTarget } from './worktrees.ts';
 import { landRefusal } from './follow-origin.ts';
 import { gateCacheDir, gh, landHold } from './land-gate.ts';
 import { activityCommand } from './activity.ts';
@@ -151,6 +151,9 @@ const HELP = `tb: talk to the Threadbear runner
                                   marked "# tb land: hold while red" holds the landings it
                                   would run for while it's red on main; --despite-red
                                   lands anyway, for the fix
+  tb worktree-folder [DIR]        the folder the repo DIR (or here) is in keeps its thread
+                                  worktrees in: <worktree.folder>/<repo>, else <repo>-threads
+                                  beside the main checkout
   tb runner add <name> (--ssh <host> | --out <file>) [--id <runnerId>]
                                   on the main Mac: a backend key for another runner that acts
                                   as that runner alone, written over ssh into its
@@ -215,6 +218,7 @@ const COMMAND_FLAGS: Record<string, string[]> = {
   export: ['out'],
   rpc: [],
   land: ['dry-run', 'despite-red'],
+  'worktree-folder': [],
   runner: ['ssh', 'out', 'id', 'json', 'finish', 'replace', 'drop', 'snapshot', 'keys-checked', 'lock-out', 'purge'],
 };
 
@@ -263,6 +267,8 @@ async function main(argv: string[]): Promise<number> {
       return 2;
     }
   }
+  // Git and patch files alone: no runner, nor its runner.json.
+  if (cmd === 'worktree-folder') return worktreeFolderCommand(args[0] ?? process.cwd());
   let cfg: ReturnType<typeof loadConfig>;
   try {
     cfg = loadConfig();
@@ -325,6 +331,21 @@ async function main(argv: string[]): Promise<number> {
 }
 
 type Flags = Record<string, string | boolean | string[] | undefined>;
+
+// `tb worktree-folder`: where new thread worktrees of the repo `dir` is in
+// go (threadsFolder), as the runner works it out, so borrow-worktree.sh
+// makes and finds its slots in the same place.
+async function worktreeFolderCommand(dir: string): Promise<number> {
+  const top = await checkoutTop(dir);
+  const main = top && (await mainCheckoutOf(top));
+  if (!main) {
+    console.error(top ? `No checkout of ${path.basename(top)} has ${MAIN} checked out.` : `${dir} isn't in a git checkout.`);
+    return 1;
+  }
+  const patch = await findWorktreePatch(main, undefined, undefined, undefined, TRUST_ALL).catch(() => undefined);
+  console.log(threadsFolder(main, patch?.folder));
+  return 0;
+}
 
 // `tb land` (docs/thread-worktrees.md, worktrees.ts). The checkout this
 // runs in, if that's on a thread/ branch; inside a thread

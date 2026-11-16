@@ -1910,6 +1910,16 @@ a name worked out as it runs), or allow Threadbear's own tools,
 can't be trusted at all, and Patches says why. Settings with none of this
 in them never ask.
 
+A repo's patch can also give each new thread there a copy of the repo of
+its own to work in: a git worktree on a branch of its own, which the Land
+chip puts on `main`. A patch in your home folder (`~/.threadbear/patches`)
+can turn that on for every repo you start threads in, and say where the
+copies go: `export default { worktree: { folder: "~/Projects/.worktrees" } }`
+puts them in `~/Projects/.worktrees/<repo>/`. When you archive a thread
+whose work is on `main` (merged on GitHub counts, squashed PRs too), its
+copy and branch go; one with work that isn't stays, and the thread says
+how to land or drop it. `docs/thread-worktrees.md` has the details.
+
 A project's page has its own panels and Patches on the right-hand rail:
 the ones its folders give its threads.
 

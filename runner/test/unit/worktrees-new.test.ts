@@ -2,18 +2,19 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { makeHarness, tmpDir } from '../helpers/fakes.ts';
 import { checkSequence, checkSummary } from '../helpers/protocol-check.ts';
 import { findWorktreePatch, readPatchModule } from '../../src/patches.ts';
-import { git, land, makeWorktree } from '../../src/worktrees.ts';
+import { cleanUpWorktree, git, land, makeWorktree } from '../../src/worktrees.ts';
 import { RpcServer } from '../../src/rpc.ts';
 import { RunnerClient } from '../../src/client.ts';
 import { readToken } from '../../src/config.ts';
 import { nullLogger } from '../../src/log.ts';
 import { PatchTrust } from '../../src/patch-trust.ts';
 import { Restarter } from '../../src/restart.ts';
-import { PATCH, commit, harness, makeRepo, sh, until, write } from '../helpers/worktrees-harness.ts';
+import { KEEP, PATCH, commit, harness, makeRepo, notes, sh, threadWithWorktree, until, write } from '../helpers/worktrees-harness.ts';
 
 // --------------------------------------------------------------- patches
 
@@ -36,6 +37,9 @@ test('a patch can carry worktree with setup and check; anything malformed is the
     [{ keep: [] }, 'worktree.keep should be a list of folders inside the repo, like "app/.build".'],
     [{ keep: ['/abs/.build'] }, 'worktree.keep should be a list of folders inside the repo, like "app/.build".'],
     [{ keep: ['../up'] }, 'worktree.keep should be a list of folders inside the repo, like "app/.build".'],
+    [{ folder: 'relative/wt' }, 'worktree.folder should be a folder, absolute or starting with ~/, like "~/Projects/.worktrees".'],
+    [{ folder: '~wt' }, 'worktree.folder should be a folder, absolute or starting with ~/, like "~/Projects/.worktrees".'],
+    [{ folder: 7 }, 'worktree.folder should be a folder, absolute or starting with ~/, like "~/Projects/.worktrees".'],
   ] as const) {
     const bad = readPatchModule('b', 'project', '/x/b.ts', { worktree });
     assert.equal(bad.info.error, error);
@@ -43,7 +47,22 @@ test('a patch can carry worktree with setup and check; anything malformed is the
   }
 });
 
-test('the nearest patch with a worktree wins; home\'s patches and broken files never count', async () => {
+test('worktree.folder is absolute or ~/, expanded; a home patch\'s worktree takes nothing else', () => {
+  assert.deepEqual(readPatchModule('f', 'project', '/x/f.ts', { worktree: { folder: '/wt/', setup: 'x' } }).worktree, { folder: '/wt', setup: 'x' });
+  assert.deepEqual(readPatchModule('f', 'project', '/x/f.ts', { worktree: { folder: '~/Projects/.worktrees' } }).worktree, { folder: path.join(os.homedir(), 'Projects/.worktrees') });
+  assert.deepEqual(readPatchModule('h', 'home', '/h/h.ts', { worktree: { folder: '~/wt' } }).worktree, { folder: path.join(os.homedir(), 'wt') });
+  assert.deepEqual(readPatchModule('h', 'home', '/h/h.ts', { worktree: {} }).worktree, {}, 'on, with worktrees where they always went');
+  for (const [worktree, error] of [
+    [{ setup: 'npm ci' }, "A home patch's worktree only takes folder; worktree.setup belongs in a repo's own patch."],
+    [{ folder: '/wt', check: 'true', teardown: 'x', keep: ['a'] }, "A home patch's worktree only takes folder; worktree.check, worktree.teardown, worktree.keep belong in a repo's own patch."],
+  ] as const) {
+    const bad = readPatchModule('h', 'home', '/h/h.ts', { worktree });
+    assert.equal(bad.info.error, error);
+    assert.equal(bad.worktree, undefined);
+  }
+});
+
+test('the nearest patch with a worktree wins; broken files, home\'s included, never count', async () => {
   const home = fs.realpathSync(tmpDir());
   write(home, {
     '.threadbear/patches/everywhere.ts': PATCH(`{ setup: "from home" }`),
@@ -54,12 +73,35 @@ test('the nearest patch with a worktree wins; home\'s patches and broken files n
     'dev/plain/x.txt': '',
   });
   const inner = await findWorktreePatch(path.join(home, 'dev/repo/pkg'), home);
-  assert.deepEqual(inner, { check: 'inner check', patch: 'inner', file: path.join(home, 'dev/repo/pkg/.threadbear/patches/inner.ts'), folder: path.join(home, 'dev/repo/pkg') });
+  assert.deepEqual(inner, { check: 'inner check', patch: 'inner', file: path.join(home, 'dev/repo/pkg/.threadbear/patches/inner.ts'), repoFrom: path.join(home, 'dev/repo/pkg') });
   const outer = await findWorktreePatch(path.join(home, 'dev/repo'), home);
   assert.equal(outer?.patch, 'c-wt');
   assert.equal(outer?.setup, 'outer');
-  assert.equal(outer?.folder, path.join(home, 'dev/repo'));
-  assert.equal(await findWorktreePatch(path.join(home, 'dev/plain'), home), undefined, "home's own patch folder isn't a repo's choice");
+  assert.equal(outer?.repoFrom, path.join(home, 'dev/repo'));
+  assert.equal(await findWorktreePatch(path.join(home, 'dev/plain'), home), undefined, 'a home patch with a setup is an error, so it turns nothing on');
+});
+
+test("a home patch turns worktrees on for any folder and says where they go; the nearest folder given wins", async () => {
+  const home = fs.realpathSync(tmpDir());
+  write(home, {
+    '.threadbear/patches/a-actions.ts': `export default { actions: [{ title: "Hi", run: "echo hi" }] };`,
+    '.threadbear/patches/worktrees.ts': PATCH(`{ folder: "/wt/home" }`),
+    'dev/repo/.threadbear/patches/checks.ts': PATCH(`{ setup: "outer", folder: "/wt/repo" }`),
+    'dev/repo/pkg/.threadbear/patches/inner.ts': PATCH(`{ check: "inner check" }`),
+    'dev/other/.threadbear/patches/checks.ts': PATCH(`{ setup: "other" }`),
+    'dev/plain/x.txt': '',
+  });
+  assert.deepEqual(await findWorktreePatch(path.join(home, 'dev/plain'), home), {
+    folder: '/wt/home', patch: 'worktrees', file: path.join(home, '.threadbear/patches/worktrees.ts'), repoFrom: path.join(home, 'dev/plain'), home: true,
+  }, "home's, with the repo found from the thread's own folder");
+  const other = await findWorktreePatch(path.join(home, 'dev/other'), home);
+  assert.equal(other?.setup, 'other', "a repo's own patch wins over home's");
+  assert.equal(other?.folder, '/wt/home', "and goes where home's says, having no folder of its own");
+  assert.equal(other?.home, undefined);
+  assert.equal((await findWorktreePatch(path.join(home, 'dev/repo'), home))?.folder, '/wt/repo', 'its own folder over home\'s');
+  const inner = await findWorktreePatch(path.join(home, 'dev/repo/pkg'), home);
+  assert.equal(inner?.check, 'inner check', 'the nearest patch with a worktree wins');
+  assert.equal(inner?.folder, '/wt/repo', 'the nearest folder given: the outer patch\'s, before home\'s');
 });
 
 // ----------------------------------------------------------- a new thread
@@ -129,6 +171,70 @@ test('worktree: false, a folder with no patches, and a repo without main checked
   const note = h.events(thread.id).find((e) => e.type === 'system.note');
   assert.equal(note?.text, `Couldn't make a worktree for this thread: no checkout of proj has main checked out. It starts in ${main} instead.`);
   assert.doesNotMatch(h.adapter.last.opts.instructions ?? '', /worktree/);
+});
+
+// A harness whose home patches are read from `home`.
+const harnessAt = (home: string) => makeHarness(undefined, {}, { actionShell: ['/bin/sh', '-c'], actionTimeoutMs: 10_000, panelsRoot: home });
+const homeWithFolder = (folder: string) => {
+  const home = fs.realpathSync(tmpDir('tb-home-'));
+  write(home, { '.threadbear/patches/worktrees.ts': PATCH(`{ folder: ${JSON.stringify(folder)} }`) });
+  return home;
+};
+
+test("with a home patch, a thread in any repo on main gets a worktree in its folder, with nothing run there, and archiving it landed removes it", async () => {
+  const { root, main } = makeRepo('');
+  const folder = path.join(root, 'worktrees');
+  const h = harnessAt(homeWithFolder(folder));
+  const { id, w } = await threadWithWorktree(h, main);
+  const wt = path.join(folder, 'proj', id.slice(0, 8));
+  assert.equal(w.path, wt);
+  assert.equal(h.adapter.last.opts.cwd, path.join(wt, 'runner'));
+  assert.deepEqual(h.events(id).filter((e) => e.type === 'action.run'), [], 'no setup');
+  assert.deepEqual(notes(h, id), [`Working in a worktree of its own at ${wt}, on the branch thread/${id.slice(0, 8)}. tb land puts it on main.`]);
+  assert.deepEqual(h.store.load(id)?.worktree, { repo: 'proj', mainCheckout: main, path: wt, branch: `thread/${id.slice(0, 8)}`, base: sh(main, 'git rev-parse main') }, 'no patch copy in it to read');
+
+  h.runner.update({ threadId: id, archived: true });
+  await until(() => notes(h, id).some((n) => n.startsWith('Removed')), 'the cleanup');
+  assert.ok(!fs.existsSync(path.join(folder, 'proj')), "the repo's folder goes once it's empty");
+  assert.ok(fs.existsSync(folder), 'the one holding it stays');
+  assert.equal(sh(main, `git branch --list 'thread/*'`), '');
+  assert.equal(notes(h, id).filter((n) => /teardown/.test(n)).length, 0, 'no teardown to skip or run');
+});
+
+test('a home patch skips a folder outside git and a repo with no checkout on main, saying nothing', async () => {
+  const { root, main } = makeRepo('');
+  const h = harnessAt(homeWithFolder(path.join(root, 'worktrees')));
+  const plain = fs.realpathSync(tmpDir());
+  const outside = h.runner.create({ text: 'Plain', accountId: 'claude-3', cwd: plain });
+  assert.equal(h.adapter.last.opts.cwd, plain, 'outside git it starts straight away');
+  assert.deepEqual(notes(h, outside.thread.id), []);
+
+  sh(main, 'git checkout -q -b other');
+  const { thread } = h.runner.create({ text: 'No main', accountId: 'claude-3', cwd: main });
+  await until(() => h.adapter.sessions.length === 2, 'the CLI to start');
+  assert.equal(h.adapter.last.opts.cwd, main);
+  assert.equal(h.runner.get(thread.id).worktree, undefined);
+  assert.deepEqual(notes(h, thread.id), [], "home's patch asks for every thread, so no note");
+  assert.ok(!fs.existsSync(path.join(root, 'worktrees')));
+});
+
+test("a repo's own patch with no folder puts its worktrees, slots and spares too, where home's patch says", async () => {
+  const { root, main } = makeRepo(KEEP);
+  const folder = path.join(root, 'wt');
+  const home = homeWithFolder(folder);
+  const patch = (await findWorktreePatch(main, home))!;
+  assert.equal(patch.folder, folder);
+  const made = await makeWorktree({ cwd: main, threadId: 'aaaaaaaa-1', patch });
+  assert.ok(made.ok);
+  assert.equal(made.worktree.path, path.join(folder, 'proj', 'slot-1'));
+  assert.equal(made.worktree.patchFile, '.threadbear/patches/checks.ts');
+  assert.deepEqual(await cleanUpWorktree(made.worktree), { removed: true, spare: true });
+  const next = await makeWorktree({ cwd: main, threadId: 'bbbbbbbb-1', patch });
+  assert.ok(next.ok);
+  assert.equal(next.worktree.path, made.worktree.path, 'the spare is found there');
+  const third = await makeWorktree({ cwd: main, threadId: 'cccccccc-1', patch });
+  assert.ok(third.ok);
+  assert.equal(third.worktree.path, path.join(folder, 'proj', 'slot-2'));
 });
 
 test('a leftover folder or branch of the same name is never reused', async () => {

@@ -84,7 +84,8 @@ type LoadedPatch = { info: PatchInfo; panels: Panel[]; actions: Action[]; hooks:
 
 // A patch's `worktree`: the repo gives each new thread a git worktree of
 // its own (docs/thread-worktrees.md, worktrees.ts). Not part of PatchSet:
-// only the thread's own folder chain counts, which findWorktreePatch reads.
+// only the thread's own folder chain and home's count, which
+// findWorktreePatch reads.
 // `keep` lists build caches (folders inside the repo) that make a
 // worktree worth reusing: SwiftPM's .build only helps in the folder it was
 // built in, so a fresh worktree builds from cold. With `keep`, an archived
@@ -93,10 +94,13 @@ type LoadedPatch = { info: PatchInfo; panels: Panel[]; actions: Action[]; hooks:
 // `teardown` runs in the worktree's root when its thread is archived or
 // deleted, before the cleanup, landed or not: for what setup made outside
 // the folder (a Convex deployment per worktree, elie-h's fork, 6 Nov), as a
-// branch landed by a squashed PR never counts as merged here.
+// worktree with work not on main stays.
 // `setupRun` and `teardownRun` are `setup` and `teardown` as they run, for
 // a patch trusted by its hash (bindAutomatic); absent, they run as written.
-export type WorktreeConfig = { setup?: string; check?: string; teardown?: string; keep?: string[]; setupRun?: string; teardownRun?: string };
+// `folder` is where the worktrees go, `<folder>/<repo>/<id8>`, as an
+// absolute path (a `~/` in the patch is expanded as it's read). A home
+// patch's `worktree` takes only this (findWorktreePatch).
+export type WorktreeConfig = { setup?: string; check?: string; teardown?: string; keep?: string[]; folder?: string; setupRun?: string; teardownRun?: string };
 
 // A folder of one of the thread's projects.
 export type ProjectFolder = { folder: string; projectId: string };
@@ -568,9 +572,22 @@ export function readPatchModule(id: string, source: 'home' | 'project', file: st
   };
   let worktree: WorktreeConfig | undefined;
   if (v.worktree !== undefined) {
-    const w = v.worktree as { setup?: unknown; check?: unknown; teardown?: unknown; keep?: unknown };
+    const w = v.worktree as { setup?: unknown; check?: unknown; teardown?: unknown; keep?: unknown; folder?: unknown };
     if (!w || typeof w !== 'object' || Array.isArray(w)) return problem('worktree should be an object with setup and/or check.');
+    // Home's patch turns worktrees on for every repo and says where they
+    // go; what runs in them is each repo's own to say.
+    const repoOnly = (['setup', 'check', 'teardown', 'keep'] as const).filter((k) => w[k] !== undefined);
+    if (source === 'home' && repoOnly.length) {
+      return problem(`A home patch's worktree only takes folder; ${repoOnly.map((k) => `worktree.${k}`).join(', ')} ${repoOnly.length === 1 ? 'belongs' : 'belong'} in a repo's own patch.`);
+    }
     worktree = {};
+    if (w.folder !== undefined) {
+      const f = w.folder;
+      if (typeof f !== 'string' || !f.trim() || !(path.isAbsolute(f) || f.startsWith('~/'))) {
+        return problem('worktree.folder should be a folder, absolute or starting with ~/, like "~/Projects/.worktrees".');
+      }
+      worktree.folder = f.startsWith('~/') ? path.join(os.homedir(), f.slice(2)) : path.resolve(f);
+    }
     for (const key of ['setup', 'check', 'teardown'] as const) {
       if (w[key] === undefined) continue;
       if (typeof w[key] !== 'string' || !w[key].trim()) return problem(`worktree.${key} should be a command.`);
@@ -695,10 +712,15 @@ export function webPage(value: unknown): string | null {
 }
 
 // The patch that gives a thread in `cwd` its own worktree: the first patch
-// file with a `worktree`, from `cwd` up (the nearest folder first). Home's
-// ~/.threadbear/patches never counts, and nor do project folders:
-// worktrees are a repo's own choice. `folder` holds the `.threadbear/`.
-export type WorktreePatch = WorktreeConfig & { patch: string; file: string; folder: string };
+// file with a `worktree`, from `cwd` up (the nearest folder first), else a
+// home patch (~/.threadbear/patches) with one, which turns worktrees on for
+// every repo. Project folders never count. The worktrees go in the nearest
+// `folder` given: the chain's (nearest first, of the patches with a
+// `worktree`), then home's.
+// `repoFrom` is where the repo is found from: the folder holding a project
+// patch's `.threadbear/`, or `cwd` for home's. `home` marks home's: there's
+// no copy of it in the worktree, and nothing of it runs there.
+export type WorktreePatch = WorktreeConfig & { patch: string; file: string; repoFrom: string; home?: true };
 
 export async function findWorktreePatch(
   cwd: string,
@@ -708,12 +730,41 @@ export async function findWorktreePatch(
   gate: PatchGate = TRUST_ALL,
   strict = false,
 ): Promise<WorktreePatch | undefined> {
+  let found: WorktreePatch | undefined;
+  let folder: string | undefined;
   for (const file of worktreePatchFiles(cwd, home, dirs)) {
-    const found = await readWorktreePatch(file, cache, dirs, gate);
-    if (strict && found && 'error' in found) throw new Error(`${file}: ${found.error}`);
-    if (found && !('error' in found)) return found;
+    const w = await readWorktreePatch(file, cache, dirs, gate);
+    if (!w) continue;
+    if ('error' in w) {
+      if (strict && !found) throw new Error(`${file}: ${w.error}`);
+      continue;
+    }
+    found ??= w;
+    folder ??= w.folder;
+    if (folder) break;
+  }
+  if (found && folder) return { ...found, folder };
+  const fromHome = await homeWorktreePatch(home, cache, dirs);
+  if (found) return fromHome?.folder ? { ...found, folder: fromHome.folder } : found;
+  return fromHome && { ...fromHome, repoFrom: path.resolve(cwd) };
+}
+
+// Home's patch with a `worktree`, the first by name. It's the user's own, so
+// it loads as home patches do, with no trust to ask (loadPatchFile).
+async function homeWorktreePatch(home: string, cache: PatchCache, dirs: FolderCache): Promise<Omit<WorktreePatch, 'repoFrom'> | undefined> {
+  for (const file of homePatchFiles(home, dirs)) {
+    const loaded = await loadPatchFile(file, 'home', cache, dirs);
+    if (loaded.info.error || !loaded.worktree) continue;
+    return { ...(loaded.worktree.folder ? { folder: loaded.worktree.folder } : {}), patch: loaded.info.id, file, home: true };
   }
   return undefined;
+}
+
+// Home's patch files (~/.threadbear/patches), any of which may turn
+// worktrees on for every repo.
+export function homePatchFiles(home: string = os.homedir(), dirs: FolderCache = new FolderCache()): string[] {
+  const dir = path.join(path.resolve(home), PATCH_DIR);
+  return dirs.isDir(dir) ? patchFiles(dir, dirs) : [];
 }
 
 // One patch file's `worktree`, if it loads and has one; `error` when it
@@ -728,10 +779,10 @@ export async function readWorktreePatch(
   if (loaded.info.error) return { error: loaded.info.error };
   if (loaded.info.untrusted) return { error: "it isn't a version you've trusted." };
   if (!loaded.worktree) return undefined;
-  return { ...loaded.worktree, patch: loaded.info.id, file, folder: path.dirname(path.dirname(path.dirname(file))) };
+  return { ...loaded.worktree, patch: loaded.info.id, file, repoFrom: path.dirname(path.dirname(path.dirname(file))) };
 }
 
-// The patch files findWorktreePatch would read, nearest folder first.
+// The project patch files findWorktreePatch reads, nearest folder first.
 // Synchronous, so a thread with none can start without waiting.
 export function worktreePatchFiles(cwd: string, home: string = os.homedir(), dirs: FolderCache = new FolderCache()): string[] {
   return patchDirs(cwd, home, dirs)

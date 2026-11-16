@@ -27,6 +27,13 @@ Object.assign(process.env, {
 
 export const TB = path.join(import.meta.dirname, '..', '..', 'bin', 'tb');
 
+// This checkout's tb first on PATH: borrow-worktree.sh asks `tb
+// worktree-folder` where the slots go, and in a thread the tb on PATH is the
+// installed runner's, which may not have it yet.
+const tbBin = tmpDir('tb-bin-');
+fs.symlinkSync(TB, path.join(tbBin, 'tb'));
+process.env.PATH = `${tbBin}${path.delimiter}${process.env.PATH}`;
+
 export function sh(cwd: string, cmd: string): string {
   return execFileSync('/bin/sh', ['-c', cmd], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 }

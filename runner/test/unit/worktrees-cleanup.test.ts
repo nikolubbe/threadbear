@@ -7,7 +7,8 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { makeHarness, tmpDir } from '../helpers/fakes.ts';
 import { checkSequence, checkSummary } from '../helpers/protocol-check.ts';
 import { automaticTrust, findWorktreePatch } from '../../src/patches.ts';
-import { cleanUpWorktree, git, gitLimits, land } from '../../src/worktrees.ts';
+import { cleanUpWorktree, fetchLimits, git, gitLimits, land, landedOnMain, type WorktreeRecord } from '../../src/worktrees.ts';
+import { worktreeLooseEnds } from '../../src/loose-ends.ts';
 import { PatchTrust } from '../../src/patch-trust.ts';
 import { HUNG_GIT_LIMIT_MS, PATCH, TEARDOWN, capture, commit, harness, lines, makeBranch, makeRepo, notes, sh, swapDuringGit, teardowns, threadWithWorktree, trustedTeardownRepo, until, wrapGit, write } from '../helpers/worktrees-harness.ts';
 
@@ -57,6 +58,78 @@ test("archiving a thread with work that isn't on main keeps the worktree and bra
   );
   assert.ok(fs.existsSync(w.path));
   assert.ok(h.runner.get(id).worktree, 'still shown');
+});
+
+// Niko, 16 Nov 2026: his repos land through squashed GitHub PRs, which git
+// never counts as merged, so their worktrees were never cleaned up.
+test("a branch squashed into main counts as landed: the loose ends don't list it and archiving removes it", async () => {
+  const { main } = makeRepo();
+  // An origin that can't be reached is no answer, and no failure.
+  sh(main, 'git remote add origin /nowhere/at/all.git');
+  const h = harness();
+  const { id, w } = await threadWithWorktree(h, main);
+  const rec = { ...w, repo: 'proj', base: 'x' } as WorktreeRecord;
+  const branch = `refs/heads/${w.branch}`;
+  commit(w.path, { 'runner/b.ts': '2\n' }, 'One');
+  commit(w.path, { 'runner/c.ts': '3\n' }, 'Two');
+  commit(main, { 'README.md': 'one\ntwo\nthree\nfour\n' }, 'Meanwhile on main');
+  assert.equal(await landedOnMain(main, branch), false);
+  assert.deepEqual((await worktreeLooseEnds(rec)).map((e) => e.text), [`2 commits on ${w.branch} aren't on main`]);
+
+  sh(main, `git merge -q --squash ${w.branch} && git commit -qm "Both (#1)"`);
+  assert.equal(await landedOnMain(main, branch), true);
+  assert.deepEqual(await worktreeLooseEnds(rec), []);
+  commit(w.path, { 'runner/d.ts': '4\n' }, 'Three');
+  assert.equal(await landedOnMain(main, branch), false, 'a commit since the squash is work not on main');
+  sh(w.path, 'git reset -q --hard HEAD~1');
+
+  h.runner.update({ threadId: id, archived: true });
+  await until(() => notes(h, id).some((n) => n.startsWith('Removed')), 'the cleanup');
+  assert.ok(!fs.existsSync(w.path));
+  assert.equal(sh(main, `git branch --list ${w.branch}`), '');
+});
+
+test('a branch squash-merged on origin (a PR merged on GitHub) counts as landed, from a fetch of origin main', async () => {
+  const { root, main } = makeRepo();
+  sh(root, 'git clone -q --bare proj origin.git');
+  sh(main, `git remote add origin ${path.join(root, 'origin.git')}`);
+  const t = makeBranch(main);
+  commit(t.path, { 'runner/b.ts': '2\n' }, 'Work');
+  const every = fetchLimits.everyMs;
+  fetchLimits.everyMs = 0;
+  try {
+    assert.equal(await landedOnMain(main, `refs/heads/${t.branch}`), false);
+    // GitHub squash-merges the PR: origin's main gets one new commit, and
+    // this Mac's main hasn't moved.
+    sh(root, `git clone -q origin.git gh && cd gh && git fetch -q ${main} ${t.branch} && git merge -q --squash FETCH_HEAD && git commit -qm "Work (#2)" && git push -q origin main`);
+    assert.equal(await landedOnMain(main, `refs/heads/${t.branch}`), true);
+    assert.equal(sh(main, 'git rev-parse refs/remotes/origin/main'), sh(path.join(root, 'gh'), 'git rev-parse HEAD'), 'origin main was fetched');
+    assert.notEqual(sh(main, 'git rev-parse main'), sh(main, 'git rev-parse origin/main'), "this Mac's main is left as it was");
+    assert.deepEqual(await cleanUpWorktree({ repo: 'proj', mainCheckout: main, path: t.path, branch: t.branch, base: 'x' }), { removed: true });
+    assert.ok(!fs.existsSync(t.path));
+    assert.equal(sh(main, `git branch --list ${t.branch}`), '');
+  } finally {
+    fetchLimits.everyMs = every;
+  }
+});
+
+test("landedOnMain runs no merge driver a repo's config names, and a file that would need one isn't counted as merged", async () => {
+  const { root, main } = makeRepo();
+  const marker = path.join(root, 'ran');
+  // Exits 0 leaving main's side: run, it would make the branch's change
+  // vanish from the merge, so the branch would read as already on main.
+  const driver = path.join(root, 'driver.sh');
+  fs.writeFileSync(driver, `#!/bin/sh\necho ran >> '${marker}'\n`, { mode: 0o755 });
+  commit(main, { '.gitattributes': '*.md merge=planted\n' }, 'attributes');
+  sh(main, `git config merge.planted.driver '${driver} %A'`);
+  const t = makeBranch(main);
+  commit(t.path, { 'README.md': 'one\nTWO\nthree\n' }, 'Theirs');
+  commit(main, { 'README.md': 'ONE\ntwo\nthree\n' }, 'Ours');
+  spawnSync('git', ['-C', main, 'merge-tree', '--write-tree', 'main', t.branch]);
+  assert.ok(fs.existsSync(marker), 'plain merge-tree runs it, so the check below means something');
+  fs.rmSync(marker);
+  assert.equal(await landedOnMain(main, `refs/heads/${t.branch}`), false);
+  assert.ok(!fs.existsSync(marker), 'the driver never ran');
 });
 
 test('cleanUpWorktree keeps a worktree with uncommitted changes to tracked files', async () => {

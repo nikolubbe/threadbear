@@ -280,8 +280,8 @@ export const labReviewPart = {
     const accounts = this.usableAccounts();
     const pools = this.pools();
     // Kept for its folder, or for the folder it came from: a thread's
-    // worktree sits beside the repo (<repo>-threads/slot-n), outside the
-    // kept folder, but it's still that pool's work (Grok's review, 15 Nov
+    // worktree sits outside the repo (<repo>-threads/slot-n beside it, or
+    // a patch's worktree.folder), outside the kept folder, but it's still that pool's work (Grok's review, 15 Nov
     // 2026: a Convex thread in a worktree was reviewed off the Convex pool).
     const ownPool = rec.poolId ? pools.find((p) => p.id === rec.poolId && p.folders?.length) : undefined;
     const kept = poolForFolder(pools, rec.cwd) ?? ownPool;

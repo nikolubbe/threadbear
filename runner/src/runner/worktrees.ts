@@ -8,8 +8,7 @@ import type { Action, EventBody } from '../protocol.ts';
 import type { ThreadRecord } from '../store.ts';
 import { BIN_DIR, threadEnv } from '../restart.ts';
 import { cleanUpWorktree, clearBuildCaches, makeWorktree, readPlainFile, sameSubfolder, stillCheckedOut, worktreeFolderNow, worktreeGone, type WorktreeRecord } from '../worktrees.ts';
-import { isDirectory } from '../fsutil.ts';
-import { automaticTrust, findWorktreePatch, isInside, readWorktreePatch, runCommand, type PatchSet, type WorktreePatch, worktreePatchFiles } from '../patches.ts';
+import { automaticTrust, findUp, findWorktreePatch, homePatchFiles, isInside, readWorktreePatch, runCommand, type PatchSet, type WorktreePatch, worktreePatchFiles } from '../patches.ts';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { ThreadState } from '../runner.ts';
@@ -19,10 +18,13 @@ export const worktreesPart = {
   // A worktree per thread (docs/thread-worktrees.md, worktrees.ts).
 
   // Whether a new thread in `cwd` might get a worktree: there's at least
-  // one patch file in its own folder chain to read.
+  // one patch file in its own folder chain to read, or one in home's and
+  // `cwd` is in a git repo (home's patch can turn them on for every repo).
+  // So a thread anywhere else starts without waiting.
   mayWantWorktree(this: Runner, cwd: string): boolean {
     try {
-      return worktreePatchFiles(cwd, this.panelsRoot).length > 0;
+      if (worktreePatchFiles(cwd, this.panelsRoot).length > 0) return true;
+      return homePatchFiles(this.panelsRoot).length > 0 && findUp(cwd, path.parse(path.resolve(cwd)).root, (d) => fs.existsSync(path.join(d, '.git'))) !== undefined;
     } catch {
       return false;
     }
@@ -70,6 +72,9 @@ export const worktreesPart = {
       return;
     }
     if (!made.ok) {
+      // Home's patch asks for every thread: one outside git, or in a repo
+      // with no checkout on main, just starts where it is.
+      if (made.quiet) return;
       this.log.warn('could not make a worktree', { threadId: rec.id, reason: made.reason });
       this.emit(st, { type: 'system.note', text: `Couldn't make a worktree for this thread: ${made.reason}. It starts in ${asked} instead.` }, turnId);
       return;
@@ -95,10 +100,11 @@ export const worktreesPart = {
 
   // A new worktree's setup (the patch's `setup`), run from the worktree's
   // own copy of the patch once that's trusted. A moved thread's worktree
-  // (runner/moves.ts) runs it too.
-  async setUpWorktree(this: Runner, st: ThreadState, made: { worktree: WorktreeRecord; patchFile: string }, patch: WorktreePatch, turnId?: string): Promise<void> {
+  // (runner/moves.ts) runs it too. A home patch's has none (it can't say
+  // one) and no copy there to read.
+  async setUpWorktree(this: Runner, st: ThreadState, made: { worktree: WorktreeRecord; patchFile?: string }, patch: WorktreePatch, turnId?: string): Promise<void> {
     const { rec, rt } = st;
-    if (!patch.setup) return;
+    if (!patch.setup || !made.patchFile) return;
     const copy = await this.worktreeCopy(made.patchFile, patch.patch, 'setup');
     if (rt.deleted) return;
     if ('skip' in copy) {
@@ -177,31 +183,24 @@ export const worktreesPart = {
   // The teardown to run as a worktree is cleaned up, from the worktree's own
   // copy of the patch that asked for it, trusted as setup's is: what's there
   // now is the thread's branch, so a teardown changed on it needs trusting
-  // like any other change to the patch. Undefined when there's none to run.
+  // like any other change to the patch. Undefined when there's none to run,
+  // as for a home patch's worktree (no patchFile): home's can't have one.
   async worktreeTeardownCommand(this: Runner, st: ThreadState): Promise<{ command: string; run?: string; patch: string } | { skip: string } | undefined> {
-    const { rec } = st;
-    const w = rec.worktree!;
-    const from = isInside(rec.cwd, w.path) && isDirectory(rec.cwd) ? rec.cwd : w.path;
-    // Older records don't say which patch it was: the nearest one in the
-    // worktree with a `worktree`, as findWorktreePatch picks.
-    const files = w.patchFile ? [path.join(w.path, w.patchFile)] : worktreePatchFiles(from, this.panelsRoot).filter((f) => isInside(f, w.path));
-    for (const file of files) {
-      if (!fs.existsSync(file)) continue;
-      const id = path.basename(file, path.extname(file));
-      const copy = await this.worktreeCopy(file, id, 'teardown');
-      if ('skip' in copy) {
-        // An untrusted copy can't be loaded to see if it has a teardown, so
-        // it's only worth a note when it looks like it might: most don't.
-        // One that isn't a plain file of a sensible size (a fifo, which
-        // would hold the runner up for ever: Codex's review, 9 Nov) might.
-        const text = readPlainFile(file);
-        if (text === undefined || /\bteardown\b/.test(text)) return { skip: copy.skip };
-        continue;
-      }
-      if (!copy.patch) continue;
-      return copy.patch.teardown ? { command: copy.patch.teardown, run: copy.patch.teardownRun, patch: copy.patch.patch } : undefined;
+    const w = st.rec.worktree!;
+    if (!w.patchFile) return undefined;
+    const file = path.join(w.path, w.patchFile);
+    if (!fs.existsSync(file)) return undefined;
+    const id = path.basename(file, path.extname(file));
+    const copy = await this.worktreeCopy(file, id, 'teardown');
+    if ('skip' in copy) {
+      // An untrusted copy can't be loaded to see if it has a teardown, so
+      // it's only worth a note when it looks like it might: most don't.
+      // One that isn't a plain file of a sensible size (a fifo, which
+      // would hold the runner up for ever: Codex's review, 9 Nov) might.
+      const text = readPlainFile(file);
+      return text === undefined || /\bteardown\b/.test(text) ? { skip: copy.skip } : undefined;
     }
-    return undefined;
+    return copy.patch?.teardown ? { command: copy.patch.teardown, run: copy.patch.teardownRun, patch: copy.patch.patch } : undefined;
   },
 
   // Runs the patch's teardown in the worktree's root, on every archive and
