@@ -17,7 +17,11 @@ const SCRIPT = path.join(import.meta.dirname, '..', '..', '..', 'scripts', 'sync
 // and the script under test then took it that it held this repo's lock too
 // and never waited, failing the lock tests in every such sync (David, 19 Nov).
 const { THREADBEAR_SYNC_LOCKED: _outer, ...outside } = process.env;
-const env = { ...outside, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_AUTHOR_NAME: 'T', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 'T', GIT_COMMITTER_EMAIL: 't@t' };
+// This checkout's tb first on PATH: borrow-worktree.sh asks `tb
+// worktree-folder` where the slots go, and the test's repo has no runner/.
+const tbBin = tmpDir('tb-bin-');
+fs.symlinkSync(path.join(import.meta.dirname, '..', '..', 'bin', 'tb'), path.join(tbBin, 'tb'));
+const env = { ...outside, PATH: `${tbBin}${path.delimiter}${process.env.PATH}`, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_AUTHOR_NAME: 'T', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 'T', GIT_COMMITTER_EMAIL: 't@t' };
 const sh = (cwd: string, cmd: string) => execFileSync(SHELL[0], [SHELL[1], cmd], { cwd, env, encoding: 'utf8' }).trim();
 
 function repos() {
