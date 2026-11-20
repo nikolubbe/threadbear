@@ -19,16 +19,28 @@ export const PATIENCE_MS = 60_000;
 // out (128 by default) and fs.watch throws, which the code takes as "no
 // watch" and relies on its timed look. The test can't tell anything then, so
 // it skips and says why, rather than failing a deploy (9 Nov).
-export function noFileWatches(t: TestContext): boolean {
+// On a Mac the watch itself starts and its 'error' event says EMFILE a
+// moment later, when the user's FSEvents streams have run out (other
+// projects' dev servers, 20 Nov), so it waits a little for that too.
+export async function noFileWatches(t: TestContext): Promise<boolean> {
+  let code: string | undefined;
   try {
-    fs.watch(os.tmpdir()).close();
-    return false;
+    const w = fs.watch(os.tmpdir());
+    code = await new Promise<string | undefined>((resolve, reject) => {
+      const quiet = setTimeout(() => resolve(undefined), 500);
+      w.on('error', (e: NodeJS.ErrnoException) => {
+        clearTimeout(quiet);
+        if (e.code === 'EMFILE' || e.code === 'ENOSPC') resolve(e.code);
+        else reject(e);
+      });
+    }).finally(() => w.close());
   } catch (e) {
-    const code = (e as NodeJS.ErrnoException).code;
+    code = (e as NodeJS.ErrnoException).code;
     if (code !== 'EMFILE' && code !== 'ENOSPC') throw e;
-    t.skip(`this machine has no file watches left (${code})`);
-    return true;
   }
+  if (!code) return false;
+  t.skip(`this machine has no file watches left (${code})`);
+  return true;
 }
 
 // Waits until cond holds or PATIENCE_MS is up. It doesn't throw: the assert
